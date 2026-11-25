@@ -1,0 +1,163 @@
+name: Build and release FCDroid
+
+# Repo layout expected (nothing else is needed):
+#   project.zip                      <- the project archive, committed to the repo root
+#   .github/workflows/build.yml      <- this file
+#
+# Every push to main/master builds and publishes a release (build-N).
+# Pushing a tag like v0.1.0 publishes that tag instead. "Run workflow" works too.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: brunodev85/winlator
+  UPSTREAM_REF: v9.0.0
+  # Winlator pins OpenXR-SDK as a git submodule without a .gitmodules file, so we fetch the exact commit it points at.
+  OPENXR_SHA: 288d3a7ebc1ad959f62d51da75baa3d27438c499
+  GRADLE_VERSION: 7.3.3
+  NDK_VERSION: 22.1.7171670
+  BUILD_TOOLS: 30.0.3
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Unpack project.zip
+        run: |
+          test -f project.zip || { echo "::error::project.zip not found in the repo root"; exit 1; }
+          mkdir -p proj
+          unzip -q project.zip -d proj
+          # tolerate a zip that wraps everything in one folder
+          if [ ! -f proj/build.gradle ] && [ "$(ls -1 proj | wc -l)" = "1" ]; then
+            inner="proj/$(ls -1 proj)"; mv "$inner"/* proj/ ; fi
+          test -f proj/scripts/apply_patches.py || { echo "::error::project.zip layout is wrong"; ls -R proj | head -50; exit 1; }
+
+      - name: Check out upstream Winlator (MIT) with Git LFS
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          lfs: true
+          path: upstream
+
+      - name: Verify the large LFS files really downloaded
+        run: |
+          size=$(stat -c%s upstream/app/src/main/assets/imagefs.txz)
+          echo "imagefs.txz is $size bytes"
+          if [ "$size" -lt 100000000 ]; then
+            echo "::error::imagefs.txz is still a Git LFS pointer. The LFS download was refused (bandwidth quota?). Tell Claude and the workflow will be switched to another source."
+            exit 1
+          fi
+
+      - name: Fetch OpenXR-SDK at the pinned commit
+        run: |
+          d=upstream/app/src/main/cpp/OpenXR-SDK
+          rm -rf "$d"; mkdir -p "$d"
+          git -C "$d" init -q
+          git -C "$d" remote add origin https://github.com/KhronosGroup/OpenXR-SDK.git
+          git -C "$d" fetch -q --depth 1 origin "$OPENXR_SHA"
+          git -C "$d" checkout -q FETCH_HEAD
+          test "$(git -C "$d" rev-parse HEAD)" = "$OPENXR_SHA"
+
+      - name: Work out version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"; name="${tag#v}"
+          else
+            tag="build-${GITHUB_RUN_NUMBER}"; name="0.1.${GITHUB_RUN_NUMBER}"
+          fi
+          {
+            echo "tag=$tag"
+            echo "name=$name"
+            echo "code=$((1000 + GITHUB_RUN_NUMBER))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Apply FCDroid patches
+        env:
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+          VERSION_CODE: ${{ steps.ver.outputs.code }}
+        run: python3 proj/scripts/apply_patches.py upstream proj
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Install Android SDK pieces
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-30" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" "cmake;3.22.1" > /dev/null
+
+      - name: Build release APK
+        run: |
+          set -o pipefail
+          gradle -p upstream assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Align and sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          bt="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
+          in=$(ls upstream/app/build/outputs/apk/release/*.apk | head -n1)
+          echo "built: $in"
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+            alias="$KEY_ALIAS"; spass="$KEYSTORE_PASSWORD"; kpass="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            echo "SIGNING=your release key" >> "$GITHUB_ENV"
+          else
+            # Throwaway key: installs fine, but the next build will NOT install over this one.
+            spass=fcdroid-temp; kpass=fcdroid-temp; alias=temp
+            keytool -genkeypair -keystore release.jks -storepass "$spass" -keypass "$kpass" -alias "$alias" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=FCDroid temp" > /dev/null
+            echo "SIGNING=temporary key (updates need uninstall first, see README)" >> "$GITHUB_ENV"
+          fi
+
+          "$bt/zipalign" -f -p 4 "$in" aligned.apk
+          "$bt/apksigner" sign --ks release.jks --ks-pass "pass:$spass" --key-pass "pass:$kpass" \
+            --ks-key-alias "$alias" --out "FCDroid-${{ steps.ver.outputs.name }}.apk" aligned.apk
+          "$bt/apksigner" verify "FCDroid-${{ steps.ver.outputs.name }}.apk"
+          rm -f release.jks
+          ls -la FCDroid-*.apk
+
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: FCDroid ${{ steps.ver.outputs.name }}
+          files: FCDroid-${{ steps.ver.outputs.name }}.apk
+          body: |
+            Sideload-only build of FCDroid (Wine + Box64 runtime based on MIT-licensed Winlator ${{ env.UPSTREAM_REF }}, Fightcade-only front end).
+            Signed with: ${{ env.SIGNING }}
+            Fightcade itself is not included; the app downloads it from the official site on first run.
